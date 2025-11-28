@@ -1,0 +1,278 @@
+let
+    Source = PowerPlatform.Dataflows(null),
+    Workspaces = Source{[Id="Workspaces"]}[Data],
+    #"622aef87-08ec-48fe-8f76-c1c005cf62d7" = Workspaces{[workspaceId="622aef87-08ec-48fe-8f76-c1c005cf62d7"]}[Data],
+    #"7e289930-f81b-4741-bbaf-a5068ad9af4e" = #"622aef87-08ec-48fe-8f76-c1c005cf62d7"{[dataflowId="7e289930-f81b-4741-bbaf-a5068ad9af4e"]}[Data],
+    UnitStatus = #"7e289930-f81b-4741-bbaf-a5068ad9af4e"{[entity="BIGIS unit_status",version=""]}[Data],
+
+    PrimaryUnits = Table.SelectRows(UnitStatus, each Text.StartsWith([unit_type], "PRIM") or Text.StartsWith([unit_type], "AIRL")),
+    FilteredTable = Table.SelectRows(PrimaryUnits, each [msg_datetime] >= DateTime.LocalNow() - #duration(93, 0, 0, 0)),
+
+    FilterEvent0 =
+        Table.SelectRows(
+            FilteredTable,
+            each not ([event_number] = 0 and [unit_status] <> "IS ")
+        ),
+
+    SortedTable = Table.Sort(FilterEvent0, {{"unit", Order.Ascending}, {"msg_datetime", Order.Ascending}}),
+    AddFixedEvent = Table.AddColumn(SortedTable, "FixedEventNumber", each if [event_number] <> 0 then [event_number] else null, type nullable number),
+    FillFixedEvent = Table.FillDown(AddFixedEvent, {"FixedEventNumber"}),
+
+    GroupedByUnit = Table.Group(
+        FillFixedEvent,
+        {"unit"},
+        {
+            {"UnitEvents", each 
+                let
+                    // Sort messages per unit by time
+                    Sorted = Table.Sort(_, {{"msg_datetime", Order.Ascending}}),
+                    AddIndex = Table.AddIndexColumn(Sorted, "RowIndex", 0, 1, Int64.Type),
+
+                    // Add previous row values
+                    AddPrev = Table.AddColumn(AddIndex, "PrevRow", each try AddIndex{[RowIndex]-1} otherwise null),
+
+                    AddISEventNumber = Table.AddColumn(AddPrev, "IS_event_number", each 
+                        let
+                            curStatus = [unit_status],
+                            curEvent = [event_number],
+                            curIndex = [RowIndex],
+                            prev = [PrevRow]
+                        in
+                            if curStatus = "IS " and curEvent = 0 and prev <> null then
+                                let
+                                    prevStatus = prev[unit_status],
+                                    prevFixedEvent = prev[FixedEventNumber],
+                                    prevEventNum = prev[event_number]
+                                in
+                                    if (prevStatus = "RS " or prevStatus = "RO ") and prevFixedEvent <> null then prevFixedEvent else null
+                            else
+                                null, 
+                        type nullable number
+                    ),
+
+                    RemoveTempCols = Table.RemoveColumns(AddISEventNumber, {"RowIndex", "PrevRow"})
+                in
+                    RemoveTempCols,
+            type table}
+        }
+    ),
+
+    ExpandedISFix = Table.ExpandTableColumn(
+        Table.TransformColumns(GroupedByUnit, {
+            "UnitEvents", each Table.RenameColumns(_, {{"unit", "unit_nest"}})
+        }),
+        "UnitEvents",
+        {"message_id", "event_number", "unit_nest", "unit_status", "msg_datetime", "IS_event_number", "unit_type", "home_station", "FixedEventNumber"},
+        {"message_id", "event_number", "unit_nest", "unit_status", "msg_datetime", "IS_event_number", "unit_type", "home_station", "FixedEventNumber"}
+    ),
+
+    FilteredRows = Table.SelectRows(ExpandedISFix, each [event_number] > 0 or [IS_event_number] <> null),
+    HomeStation = Table.AddColumn(FilteredRows, "FRV", each if Text.StartsWith([home_station], "FS") then "FRV" else "CFA/Radio"),
+
+    EnsureNumericTypes = Table.TransformColumns(HomeStation, {
+        {"event_number", each try Number.From(_) otherwise null, type nullable number},
+        {"IS_event_number", each try Number.From(_) otherwise null, type nullable number}
+    }),
+    AddedEventMerge = Table.AddColumn(EnsureNumericTypes, "event_n_merge", each 
+        if [IS_event_number] <> null then Text.From([IS_event_number])
+        else if [event_number] <> null then Text.From([event_number])
+        else null, type text),
+
+    // Clean up for pivot
+    SelectColumns = Table.SelectColumns(AddedEventMerge, {"event_n_merge", "msg_datetime", "unit_status", "unit", "home_station"}),
+
+    GroupedForPivot = Table.Group(
+        SelectColumns,
+        {"event_n_merge", "unit", "unit_status", "home_station"},
+        {{"LatestTime", each List.Min([msg_datetime]), type nullable datetime}}
+    ),
+
+    TransformToText = Table.TransformColumns(GroupedForPivot, {{"LatestTime", each Text.From(_, "en-AU"), type text}}),
+
+    PivotedColumn = Table.Pivot(
+        TransformToText,
+        List.Distinct(TransformToText[unit_status]),
+        "unit_status",
+        "LatestTime",
+        List.Min
+    ),
+
+    NoArrival = Table.SelectRows(PivotedColumn, each ([#"OS "] <> null) and ([#"EN "] <> null)),
+
+    ConvertedDateTimeColumns = Table.TransformColumns(
+        NoArrival,
+        {
+            {"OS ", each try DateTime.FromText(Text.Trim(_), "en-AU") otherwise null, type nullable datetime},
+            {"RS ", each try DateTime.FromText(Text.Trim(_), "en-AU") otherwise null, type nullable datetime},
+            {"DI ", each try DateTime.FromText(Text.Trim(_), "en-AU") otherwise null, type nullable datetime},
+            {"EN ", each try DateTime.FromText(Text.Trim(_), "en-AU") otherwise null, type nullable datetime},
+            {"OA ", each try DateTime.FromText(Text.Trim(_), "en-AU") otherwise null, type nullable datetime},
+            {"RO ", each try DateTime.FromText(Text.Trim(_), "en-AU") otherwise null, type nullable datetime},
+            {"FD ", each try DateTime.FromText(Text.Trim(_), "en-AU") otherwise null, type nullable datetime},
+            {"IS ", each try DateTime.FromText(Text.Trim(_), "en-AU") otherwise null, type nullable datetime}
+        }
+    ),
+
+    RenamedColumns = Table.RenameColumns(
+        ConvertedDateTimeColumns,
+        {
+            {"OS ", "OS"},
+            {"RS ", "RS"},
+            {"DI ", "DI"},
+            {"EN ", "EN"},
+            {"OA ", "OA"},
+            {"RO ", "RO"},
+            {"FD ", "FD"},
+            {"IS ", "IS"}
+        }
+    ),
+
+    GroupedRows = Table.Group(
+        RenamedColumns,
+        {"event_n_merge"},
+        {
+            {"AllRowsGrouped", each Table.AddIndexColumn(
+                Table.Sort(_, {{"OS", Order.Ascending}}),
+                "Row Rank", 1, 1
+            ),
+            type table [
+                event_n_merge=nullable text,
+                unit=nullable text,
+                OS=nullable datetime,
+                RS=nullable datetime,
+                DI=nullable datetime,
+                EN=nullable datetime,
+                OA=nullable datetime,
+                RO=nullable datetime,
+                FD=nullable datetime,
+                IS=nullable datetime,
+                Row Rank=nullable number
+            ]}
+        }
+    ),
+
+    ExpandedAllRowsGrouped = Table.ExpandTableColumn(
+        GroupedRows,
+        "AllRowsGrouped",
+        {"unit", "OS", "RS", "DI", "EN", "OA", "RO", "FD", "IS", "Row Rank","home_station"},
+        {"unit", "OS", "RS", "DI", "EN", "OA", "RO", "FD", "IS", "OS Rank","home_station"}
+    ),
+
+    ReorderedColumns = Table.ReorderColumns(ExpandedAllRowsGrouped, {"event_n_merge", "unit","home_station", "OS Rank", "DI", "EN", "OS", "OA", "RS", "RO", "FD", "IS"}),
+
+    AddedTO = Table.AddColumn(ReorderedColumns, "TO (turnout)", each 
+        let d = Duration.From([EN] - [DI]) in Text.PadStart(Text.From(Number.RoundDown(Duration.TotalSeconds(d)/60)),2,"0") & ":" & Text.PadStart(Text.From(Number.Mod(Duration.TotalSeconds(d),60)),2,"0"), type text),
+
+    AddedRT = Table.AddColumn(AddedTO, "RT (response time)", each 
+        let d = Duration.From([OS] - [DI]) in Text.PadStart(Text.From(Number.RoundDown(Duration.TotalSeconds(d)/60)),2,"0") & ":" & Text.PadStart(Text.From(Number.Mod(Duration.TotalSeconds(d),60)),2,"0"), type text),   
+
+    AddedRSLastFlag = Table.AddColumn(AddedRT, "RS_Last_Flag", each [IS] = null, type logical),
+
+    AddedOut = Table.AddColumn(AddedRSLastFlag, "Out (TO - OS)", each 
+        let d = Duration.From([OS] - [EN]) in Text.PadStart(Text.From(Number.RoundDown(Duration.TotalSeconds(d)/60)),2,"0") & ":" & Text.PadStart(Text.From(Number.Mod(Duration.TotalSeconds(d),60)),2,"0"), type text),
+
+    AddedTOS = Table.AddColumn(AddedOut, "TOS (time on scene)", each 
+        let
+            returnTime = if [RS] <> null then [RS] else if [RO] <> null then [RO] else null
+        in
+            if returnTime <> null then
+                let
+                    d = Duration.From(returnTime - [OS]),
+                    totalSec = Duration.TotalSeconds(d),
+                    min = Number.RoundDown(totalSec / 60),
+                    sec = Number.RoundDown(Number.Mod(totalSec, 60))
+                in
+                    Text.PadStart(Text.From(min), 2, "0") & ":" & Text.PadStart(Text.From(sec), 2, "0")
+            else null,
+        type text),
+
+    AddedIn = Table.AddColumn(AddedTOS, "In (Return - IS)", each 
+        if [IS] <> null and ([RS] <> null or [RO] <> null) then 
+            let
+                returnTime = if [RS] <> null then [RS] else [RO],
+                d = Duration.From([IS] - returnTime),
+                totalSec = Duration.TotalSeconds(d),
+                prefix = if totalSec < 0 then "-" else "",
+                min = Number.Abs(Number.RoundDown(totalSec / 60)),
+                sec = Number.Abs(Number.RoundDown(Number.Mod(totalSec, 60)))
+            in
+                prefix & Text.PadStart(Text.From(min), 2, "0") & ":" & Text.PadStart(Text.From(sec), 2, "0")
+        else null, type nullable text),
+
+    AddedTotalTime = Table.AddColumn(AddedIn, "Total Time (EN - IS or RS)", each 
+        if [IS] <> null then 
+            let d = Duration.From([IS] - [DI]) in
+                Text.PadStart(Text.From(Number.RoundDown(Duration.TotalSeconds(d)/60)),2,"0") 
+                & ":" & Text.PadStart(Text.From(Number.Mod(Duration.TotalSeconds(d),60)),2,"0")
+        else if [RS] <> null then 
+            let d = Duration.From([RS] - [DI]) in
+                Text.PadStart(Text.From(Number.RoundDown(Duration.TotalSeconds(d)/60)),2,"0") 
+                & ":" & Text.PadStart(Text.From(Number.Mod(Duration.TotalSeconds(d),60)),2,"0")
+        else if [RO] <> null then 
+            let d = Duration.From([RO] - [DI]) in
+                Text.PadStart(Text.From(Number.RoundDown(Duration.TotalSeconds(d)/60)),2,"0") 
+                & ":" & Text.PadStart(Text.From(Number.Mod(Duration.TotalSeconds(d),60)),2,"0")
+        else null, type nullable text),
+
+    // Add Minutes Out of Station
+    AddedMinutesOut = Table.AddColumn(AddedTotalTime, "Total Minutes Out of Station", each 
+        if [IS] <> null then Number.Round(Duration.TotalSeconds([IS] - [DI]) / 60, 1)
+        else if [RS] <> null then Number.Round(Duration.TotalSeconds([RS] - [DI]) / 60, 1)
+        else if [RO] <> null then Number.Round(Duration.TotalSeconds([RO] - [DI]) / 60, 1)       
+        else null, type nullable number),
+
+    // Calculate uncapped 'In' duration
+    AddedActualIn = Table.AddColumn(AddedMinutesOut, "IN Actual Minutes", each 
+        if [IS] <> null and ([RS] <> null or [RO] <> null) then 
+            let
+                returnTime = if [RS] <> null then [RS] else [RO],
+                inSeconds = Duration.TotalSeconds([IS] - returnTime),
+                inMinutes = Number.Round(inSeconds / 60, 1)
+            in
+                if inMinutes < 0 then 0 else inMinutes
+        else null, type nullable number),
+
+    // Apply 15-minute cap to In
+    AddedCappedIn = Table.AddColumn(AddedActualIn, "IN Chargeable Minutes", each 
+        if [IN Actual Minutes] <> null then 
+            if [IN Actual Minutes] > 15 then 15 
+            else [IN Actual Minutes]
+        else null, type nullable number),
+
+    AddedDescription = Table.AddColumn(
+        AddedCappedIn,
+        "Description",
+        each 
+            if [OS] = null then "Don't include – No OS"
+            else if [DI] = null then "Don't include – No DI"
+            else if [RS] = null and [RO] = null then "Include Appliance – Unit Arrived on Scene, no Return time"
+            else if [IS] = null then "Include Appliance – no In Station time"
+            else if Text.Contains([#"TOS (time on scene)"], "-") then "Review data – appliance returning to station before it arrived on-scene"
+            else if [IN Actual Minutes] <> null and [IN Actual Minutes] > 15 then "Include Appliance – Cap applied (In > 15 mins)"
+            else "Include Appliance",
+        type text
+    ),
+    
+    AddedChargedMinutes = Table.AddColumn(AddedDescription, "Charged Minutes", each 
+        let
+            description = [Description],
+            totalOut = [Total Minutes Out of Station],
+            actualIn = [IN Actual Minutes],
+            cappedIn = [IN Chargeable Minutes],
+            fallbackOut = try Duration.TotalSeconds(Duration.From([OS] - [EN])) / 60 otherwise null,
+            baseMinutes = if totalOut <> null then totalOut else fallbackOut,
+            excessIn = if actualIn <> null and cappedIn <> null and actualIn > cappedIn 
+                    then actualIn - cappedIn else 0,
+            adjustedOut = if baseMinutes <> null then baseMinutes - excessIn else null
+        in
+            if Text.StartsWith(description, "Don't include") then null
+            else if adjustedOut <> null then Number.RoundUp((adjustedOut) / 15) * 15
+            else null,
+        type nullable number
+    ),
+
+    #"Removed Columns" = Table.RemoveColumns(AddedChargedMinutes,{"OA", "FD", "RS_Last_Flag"}),
+    #"Duplicated Column" = Table.DuplicateColumn(#"Removed Columns", "event_n_merge", "event_num"),
+    #"Changed Type" = Table.TransformColumnTypes(#"Duplicated Column",{{"event_num", Int64.Type}})
+in
+    #"Changed Type"
